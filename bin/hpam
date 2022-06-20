@@ -1,0 +1,320 @@
+#!/bin/sh -e
+#L:
+#L:  MIT License
+#L:  
+#l:  Bug reports, feature requests to gemini|https://harkadev.com/oss
+#l:  Copyright (c) 2022 Harkaitz Agirre, harkaitz.aguirre@gmail.com
+#L:
+#L:  Permission is hereby granted, free of charge, to any person obtaining
+#L:  a copy of this software and associated documentation files (the
+#L:  "Software"), to deal in the Software without restriction, including
+#L:  without limitation the rights to use, copy, modify, merge, publish,
+#L:  distribute, sublicense, and/or sell copies of the Software, and to
+#L:  permit persons to whom the Software is furnished to do so, subject to
+#L:  the following conditions:
+#L:
+#L:  The above copyright notice and this permission notice shall be
+#L:  included in all copies or substantial portions of the Software.
+#L:
+#L:  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+#L:  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#L:  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+#L:  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+#L:  LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#L:  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+#L:  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+##:
+#h: Usage: $0
+#h:
+#h: Per application PAM permission manager.
+##:
+. hmenu
+. hlog
+. hterm
+. hpkg
+. hfile
+hpam() {
+    hmenu -t '|  _   _ ____   _    __  __ 
+              | | | | |  _ \ / \  |  \/  |
+              | | |_| | |_) / _ \ | |\/| |
+              | |  _  |  __/ ___ \| |  | |
+              | |_| |_|_| /_/   \_\_|  |_|
+              | Per application PAM permission manager.
+              |
+              | q|quit          : Quit this menu.
+              | h|help          : Print this help.' \
+          -m '|
+              | show                    : Show configuration.
+              | install-deps            : Install dependencies on supported machines.
+              | install-service SERVICE : Install new pam service.
+              | secure                  : Secure all services in the machine.
+              |
+              | add [USERNAME]                : Add user.
+              | del [USERNAME]                : Delete user.
+              | users                         : List users.
+              | chpass [USERNAME]             : Change the password.
+              | services                      : List services.
+              | allow [SERVICE] [USERS...]    : Allow users to service.
+              | disallow [SERVICE] [USERS...] : Disallow users from service.
+              | summary                       : List users by permissions.
+              ' \
+           -p 'hpam> '        \
+           -f 'hpam_'         \
+           -o show            \
+           -o install-deps    \
+           -o install-service \
+           -o secure          \
+           -o add             \
+           -o del             \
+           -o users           \
+           -o chpass          \
+           -o services        \
+           -o allow           \
+           -o disallow        \
+           -o summary         \
+           "$@"
+}
+hpam_show() {
+    echo "HPAM_HOMEDIR      : ${HPAM_HOMEDIR}"
+    echo "HPAM_NOLOGIN      : ${HPAM_NOLOGIN}"
+    echo "HPAM_GROUP        : ${HPAM_GROUP}"
+    echo "HPAM_GROUP_PREFIX : ${HPAM_GROUP_PREFIX}"
+    echo "PAMDIR            : ${PAMDIR}"
+}
+hpam_calc() {
+    HPAM_HOMEDIR="${HPAM_HOMEDIR:-/home}"
+    HPAM_NOLOGIN="${HPAM_NOLOGIN:-`which nologin 2>/dev/null || true`}"
+    HPAM_GROUP="${HPAM_GROUP:-hpam}"
+    HPAM_GROUP_PREFIX="${HPAM_GROUP_PREFIX:-allowed-}"
+    PAMDIR="${PAMDIR:-/etc/pam.d}"
+}
+## -----------------------------------------------------------------------------
+hpam_install_deps() {
+    ## Install the required software.
+    if hpkg -c @freebsd; then
+        hpkg -m 'Installing "pam_require.so" ...' \
+             -w "/usr/local/lib/pam_require.so"   \
+             -i %pkg "pam_require"
+    fi
+    ## Add the group.
+    hlog info "Creating group \"${HPAM_GROUP}\" ..."
+    if hpkg -c @freebsd; then
+        sudo pw groupadd "${HPAM_GROUP}" || true
+    elif which groupadd >/dev/null 2>&1; then
+        sudo groupadd "${HPAM_GROUP}" || true
+    else
+        hlog error "Do not know how to create a group."
+        return 1
+    fi
+}
+hpam_install_service() {
+    hlog errif "Please specify a service name." test ! -n "${1}"
+    hlog errif "The service already exists."    test -e "${PAMDIR}/${1}"
+    if hpkg -c @freebsd; then
+        hfile create sudo "${PAMDIR}/${1}" <<-EOF
+	auth      required   pam_unix.so         debug
+	account   required   pam_unix.so
+	password  required   pam_unix.so         shadow nullok use_authtok
+	EOF
+    else
+        hfile create sudo "${PAMDIR}/${1}" <<-EOF
+	auth      required   pam_unix.so         debug
+	account   required   pam_unix.so
+	password  required   pam_unix.so         shadow nullok use_authtok
+	EOF
+    fi
+    hpam_secure
+}
+hpam_secure() {
+    ## Ensure that the modules are present.
+    if hpkg -c @freebsd; then
+        hlog errif "PAM module missing: pam_require.so" test ! -f "/usr/local/lib/pam_require.so"
+    else
+        hlog errif "PAM module missing: pam_succeed_if.so" test ! -f "/usr/lib/security/pam_succeed_if.a"
+    fi
+    ## Adding the HPAM section...
+    for s in `hpam_services`; do
+        local g="${HPAM_GROUP_PREFIX}${s}"
+        case "${s}" in su|system) continue;; esac
+        if hpkg -c @freebsd; then
+            hlog info "${PAMDIR}/${s}: Adding @wheel @${HPAM_GROUP_PREFIX}${s} ..."
+            hfile fadd sudo "${PAMDIR}/${s}" "HPAM" <<-EOF
+		account    required    pam_require.so      @wheel @${g}
+		EOF
+        else
+            hlog info "${PAMDIR}/${s}: Adding @wheel @${HPAM_GROUP_PREFIX}${s} ..."
+            hfile fadd sudo "${PAMDIR}/${s}" "HPAM" <<-EOF
+		auth      required   pam_succeed_if.so   user ingroup ${g}
+		EOF
+        fi
+    done
+}
+hpam_add() {
+    if test -n "$1"; then
+        local user="$1"
+    else
+        local user="`hterm ask "Specify the new username" "q"`"
+        test -n "${user}"
+        if test @"${user}" = @"q"; then
+           return 1
+        fi
+    fi
+    hlog info "Adding user ${user} ..."
+    if test ! -n "${HPAM_NOLOGIN}"; then
+        hlog error "Do not know where the nologin program is located."
+        return 1
+    elif hpkg -c @freebsd; then
+        sudo pw useradd                   \
+             "${user}"                    \
+             -m                           \
+             -d "${HPAM_HOMEDIR}/${user}" \
+             -s "${HPAM_NOLOGIN}"         \
+             -g "${HPAM_GROUP}"           \
+             -G "${HPAM_GROUP}" || true
+    elif which adduser >/dev/null 2>&1; then
+        sudo adduser                              \
+             --system                             \
+             --home="${HPAM_HOMEDIR}/${username}" \
+             --shell="${HPAM_NOLOGIN}"            \
+             --ingroup="${HPAM_GROUP}"            \
+             "${user}" || true
+    else
+        hlog error "Do not know how to add a user in this system."
+        return 1
+    fi
+}
+hpam_del() {
+    if test -n "$1"; then
+        local user="$1"
+    else
+        hpam_users
+        local user="`hterm ask "Specify username to delete" "q"`"
+        test -n "${user}"
+        if test @"${user}" = @"q";then
+           return 1
+        fi
+    fi
+    if hpkg -c @freebsd; then
+        hlog info "Deleting user ${user} ..."
+        sudo pw userdel "${user}"
+    else
+        hlog error "Do not know how to delete a user."
+        return 1
+    fi
+}
+hpam_users() {
+    awk -v g="${HPAM_GROUP}" -F ":" '$1 == g || $1 == "wheel" {print $4}' /etc/group \
+        | tr ',' '\n' \
+        | sed '/README/d'
+}
+hpam_chpass() {
+    if test -n "$1"; then
+        local user="$1"
+        shift
+    else
+        hpam_users
+        local user="`hterm ask "Specify username to change password" "q"`"
+        test -n "${user}"
+        if test @"${user}" = @"q"; then
+           return 1
+        fi
+    fi
+    local pass="$1"
+    if test ! -n "${pass}" && which passwd >/dev/null 2>&1; then
+        hlog info "Changing the password of ${user} ..."
+        sudo passwd "${user}"
+    elif hpkg -c @freebsd; then
+        hlog info "Changing the password of ${user} ..."
+        echo "${pass}" | sudo pw mod user "${user}" -h 0
+    elif which passwd >/dev/null 2>&1; then
+        sudo passwd "${user}" "${pass}"
+    else
+        hlog error "Do not know how to change the password of a user."
+        return 1
+    fi
+}
+hpam_services() {
+    hlog errif "${PAMDIR}: The directory does not exist." test ! -d "${PAMDIR}"
+    ls "${PAMDIR}"
+}
+hpam_allow() {
+    local username=
+    if test -n "$1"; then
+        local service="$1"
+        shift
+    else
+        hpam_services
+        local service="`hterm ask "Service" q`"
+        test -n "${service}"
+        if test @"${service}" = @"q"; then return 1; fi
+    fi
+    hlog errif "The service ${s} does not exist." test ! -e "${PAMDIR}/${s}"
+    local group="${HPAM_GROUP_PREFIX}${service}"
+    for username in "$@"; do
+        hlog info "Creating group \"${group}\" ..."
+        if hpkg -c @freebsd; then
+            sudo pw groupadd "${group}" || true
+        elif which groupadd >/dev/null 2>&1; then
+            sudo groupadd "${group}" || true
+        else
+            hlog error "Do not know how to create a group."
+            return 1
+        fi
+        hlog info "Adding user \"${username}\" to group \"${group}\"."
+        if hpkg -c @freebsd; then
+            sudo pw group mod "${group}" -m "${username}"
+        else
+            sudo usermod -a -G "${group}" "${username}"
+        fi
+    done
+}
+hpam_disallow() {
+    local username=
+    if test -n "$1"; then
+        local service="$1"
+        shift
+    else
+        hpam_services
+        local service="`hterm ask "Service" q`"
+        test -n "${service}"
+        if test @"${service}" = @"q"; then return 1; fi
+    fi
+    local group="${HPAM_GROUP_PREFIX}${service}"
+    for username in "$@"; do
+        hlog info "Removing user \"${username}\" from group \"${group}\"."
+        if hpkg -c @freebsd; then
+            sudo pw group mod "${group}" -d "${username}"
+        elif which gpasswd >/dev/null 2>&1; then
+            vrun sudo gpasswd -d "${username}" "${group}"
+        else
+            hlog error "Do not know how to remove a user from a group."
+            return 1
+        fi
+    done
+}
+hpam_summary() {
+    for u in `hpam_users`; do
+        printf '%-10s : ' "${u}"
+        id -Gn "${u}" \
+            | tr ' ' '\n' \
+            | sed -n "s|^${HPAM_GROUP_PREFIX}||p;s/^wheel$/all(wheel)/p" \
+            | sort \
+            | tr '\n' ' '
+        printf '\n'
+    done | sort
+}
+## -----------------------------------------------------------------------------
+hpam_calc
+SCRNAME="`basename "$0"`"
+if test @"${SCRNAME}" = @"hpam";then
+    case "${1}" in
+        -h|--help)
+            sed -n 's/^ *#h: \{0,1\}//p' "$0" | sed "s|\\\$0|${SCRNAME}|g"
+            echo ""
+            sed -n 's/^ *#l: \{0,2\}//p' "$0"
+            ;;
+        *)
+            hpam "$@"
+            ;;
+    esac
+fi
